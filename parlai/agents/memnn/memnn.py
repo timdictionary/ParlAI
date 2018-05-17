@@ -6,6 +6,7 @@
 
 from parlai.core.agents import Agent
 from parlai.core.dict import DictionaryAgent
+from parlai.core.utils import maintain_dialog_history
 
 import torch
 from torch import optim
@@ -16,7 +17,7 @@ import os
 import copy
 import random
 
-from .modules import MemNN
+from .modules import MemNN, Decoder
 
 
 class MemnnAgent(Agent):
@@ -25,25 +26,39 @@ class MemnnAgent(Agent):
 
     @staticmethod
     def add_cmdline_args(argparser):
-        DictionaryAgent.add_cmdline_args(argparser)
-        argparser.add_arg('-lr', '--learning-rate', type=float, default=0.01,
+        arg_group = argparser.add_argument_group('MemNN Arguments')
+        arg_group.add_argument('--init-model', type=str, default=None,
+            help='load dict/features/weights/opts from this file')
+        arg_group.add_argument('-lr', '--learning-rate', type=float, default=0.01,
             help='learning rate')
-        argparser.add_arg('--embedding-size', type=int, default=128,
+        arg_group.add_argument('--embedding-size', type=int, default=128,
             help='size of token embeddings')
-        argparser.add_arg('--hops', type=int, default=3,
+        arg_group.add_argument('--hops', type=int, default=3,
             help='number of memory hops')
-        argparser.add_arg('--mem-size', type=int, default=100,
+        arg_group.add_argument('--mem-size', type=int, default=100,
             help='size of memory')
-        argparser.add_arg('--time-features', type='bool', default=True,
+        arg_group.add_argument('--time-features', type='bool', default=True,
             help='use time features for memory embeddings')
-        argparser.add_arg('--position-encoding', type='bool', default=False,
+        arg_group.add_argument('--position-encoding', type='bool', default=False,
             help='use position encoding instead of bag of words embedding')
-        argparser.add_arg('--optimizer', default='adam',
+        arg_group.add_argument('--output', type=str, default='rank',
+            help='type of output (rank|generate)')
+        arg_group.add_argument('--rnn-layers', type=int, default=2,
+            help='number of hidden layers in RNN decoder for generative output')
+        arg_group.add_argument('--dropout', type=float, default=0.1,
+            help='dropout probability for RNN decoder training')
+        arg_group.add_argument('--optimizer', default='adam',
             help='optimizer type (sgd|adam)')
-        argparser.add_argument('--no-cuda', action='store_true', default=False,
+        arg_group.add_argument('--no-cuda', action='store_true', default=False,
             help='disable GPUs even if available')
-        argparser.add_arg('--gpu', type=int, default=-1,
+        arg_group.add_argument('--gpu', type=int, default=-1,
             help='which GPU device to use')
+        arg_group.add_argument('-histr', '--history-replies',
+            default='label_else_model', type=str,
+            choices=['none', 'model', 'label', 'label_else_model'],
+            help='Keep replies in the history, or not.')
+        DictionaryAgent.add_cmdline_args(argparser)
+        return arg_group
 
     def __init__(self, opt, shared=None):
         opt['cuda'] = not opt['no_cuda'] and torch.cuda.is_available()
@@ -52,33 +67,72 @@ class MemnnAgent(Agent):
             torch.cuda.device(opt['gpu'])
 
         if not shared:
-            self.opt = opt
             self.id = 'MemNN'
             self.dict = DictionaryAgent(opt)
-            freqs = torch.LongTensor(list(self.dict.freqs().values()))
+            self.answers = [None] * opt['batchsize']
+            self.model = MemNN(opt, len(self.dict))
 
-            self.model = MemNN(opt, freqs)
+        else:
+            self.dict = shared['dict']
+            # model is shared during hogwild
+            if 'threadindex' in shared:
+                torch.set_num_threads(1)
+                self.model = shared['model']
+                self.decoder = shared['decoder']
+                self.answers = [None] * opt['batchsize']
+            else:
+                self.answers = shared['answers']
+
+        if hasattr(self, 'model'):
+            self.opt = opt
             self.mem_size = opt['mem_size']
             self.loss_fn = CrossEntropyLoss()
-            self.answers = [None] * opt['batchsize']
+
+            self.decoder = None
+            self.longest_label = 1
+            self.NULL_IDX = self.dict[self.dict.null_token]
+            self.END = self.dict.end_token
+            self.END_TENSOR = torch.LongTensor(self.dict[self.END])
+            self.START = self.dict.start_token
+            self.START_TENSOR = torch.LongTensor(self.dict[self.START])
+
+            if opt['output'] == 'generate' or opt['output'] == 'g':
+                self.decoder = Decoder(opt['embedding_size'], opt['embedding_size'],
+                                        opt['rnn_layers'], opt, self.dict)
+            if opt['cuda'] and not shared:
+                self.model.share_memory()
+                if self.decoder is not None:
+                    self.decoder.cuda()
+
+            elif opt['output'] != 'rank' and opt['output'] != 'r':
+                raise NotImplementedError('Output type not supported.')
 
             optim_params = [p for p in self.model.parameters() if p.requires_grad]
+            lr = opt['learning_rate']
             if opt['optimizer'] == 'sgd':
-                self.optimizer = optim.SGD(optim_params, lr=opt['learning_rate'])
+                self.optimizers = {'memnn': optim.SGD(optim_params, lr=lr)}
+                if self.decoder is not None:
+                    self.optimizers['decoder'] = optim.SGD(self.decoder.parameters(), lr=lr)
             elif opt['optimizer'] == 'adam':
-                self.optimizer = optim.Adam(optim_params, lr=opt['learning_rate'])
+                self.optimizers = {'memnn': optim.Adam(optim_params, lr=lr)}
+                if self.decoder is not None:
+                    self.optimizers['decoder'] = optim.Adam(self.decoder.parameters(), lr=lr)
             else:
                 raise NotImplementedError('Optimizer not supported.')
 
-            if opt['cuda']:
-                self.model.share_memory()
+            # check first for 'init_model' for loading model from file
+            if opt.get('init_model') and os.path.isfile(opt['init_model']):
+                init_model = opt['init_model']
+            # next check for 'model_file'
+            elif opt.get('model_file') and os.path.isfile(opt['model_file']):
+                init_model = opt['model_file']
+            else:
+                init_model = None
+            if init_model is not None:
+                print('Loading existing model parameters from ' + init_model)
+                self.load(init_model)
 
-            if opt.get('model_file') and os.path.isfile(opt['model_file']):
-                print('Loading existing model parameters from ' + opt['model_file'])
-                self.load(opt['model_file'])
-        else:
-            self.answers = shared['answers']
-
+        self.history = {}
         self.episode_done = True
         self.last_cands, self.last_cands_list = None, None
         super().__init__(opt, shared)
@@ -86,103 +140,150 @@ class MemnnAgent(Agent):
     def share(self):
         shared = super().share()
         shared['answers'] = self.answers
+        shared['dict'] = self.dict
+        if self.opt.get('numthreads', 1) > 1:
+            shared['model'] = self.model
+            shared['decoder'] = self.decoder
         return shared
 
     def observe(self, observation):
-        observation = copy.copy(observation)
-        if not self.episode_done:
-            # if the last example wasn't the end of an episode, then we need to
-            # recall what was said in that example
-            prev_dialogue = self.observation['text']
-            batch_idx = self.opt.get('batchindex', 0)
-            if self.answers[batch_idx] is not None:
-                prev_dialogue += '\n' + self.answers[batch_idx]
-                self.answers[batch_idx] = None
-            observation['text'] = prev_dialogue + '\n' + observation['text']
-        self.observation = observation
+        """Save observation for act.
+        If multiple observations are from the same episode, concatenate them.
+        """
         self.episode_done = observation['episode_done']
-        return observation
+        # shallow copy observation (deep copy can be expensive)
+        obs = observation.copy()
+        batch_idx = self.opt.get('batchindex', 0)
 
-    def update(self, xs, ys, cands):
-        self.model.train()
-        self.optimizer.zero_grad()
+        obs['text'] = (maintain_dialog_history(
+        self.history, obs,
+        reply=self.answers[batch_idx] if self.answers[batch_idx] is not None else '',
+        historyLength=self.opt['mem_size'] + 1,
+        useReplies=self.opt['history_replies'],
+        dict=self.dict, useStartEndIndices=False, splitSentences=True))
 
+        self.observation = obs
+        self.answers[batch_idx] = None
+        return obs
+
+    def predict(self, xs, cands, ys=None):
+        is_training = ys is not None
+        if is_training:
+            # Subsample to reduce training time
+            cands = [list(set(random.sample(c, min(32, len(c))) + self.labels))
+                     for c in cands]
+        else:
+            # rank all cands to increase accuracy
+            cands = [list(set(c)) for c in cands]
+
+        self.model.train(mode=is_training)
         # Organize inputs for network (see contents of xs and ys in batchify method)
-        inputs = [xs[0], xs[1], ys[0], xs[2], xs[3], ys[1]]
-        inputs = [Variable(x) for x in inputs]
-        output_embeddings, answer_embeddings = self.model(*inputs)
-        scores = self.score(cands, output_embeddings, answer_embeddings)
+        inputs = [Variable(x) for x in xs]
+        output_embeddings = self.model(*inputs)
 
-        label_inds = [cand_list.index(self.labels[i]) for i, cand_list in enumerate(cands)]
-        label_inds = Variable(torch.LongTensor(label_inds))
-        if self.opt['cuda']:
-            label_inds = label_inds.cuda(async=True)
+        if self.decoder is None:
+            scores = self.score(cands, output_embeddings)
+            if is_training:
+                label_inds = [cand_list.index(self.labels[i]) for i, cand_list in enumerate(cands)]
+                if self.opt['cuda']:
+                    label_inds = Variable(torch.cuda.LongTensor(label_inds))
+                else:
+                    label_inds = Variable(torch.LongTensor(label_inds))
+                loss = self.loss_fn(scores, label_inds)
+            predictions = self.ranked_predictions(cands, scores)
+        else:
+            self.decoder.train(mode=is_training)
 
-        loss = self.loss_fn(scores, label_inds)
-        loss.backward()
-        self.optimizer.step()
-        return self.ranked_predictions(cands, scores)
+            output_lines, loss = self.decode(output_embeddings, ys)
+            predictions = self.generated_predictions(output_lines)
 
-    def predict(self, xs, cands):
-        self.model.eval()
+        if is_training:
+            for o in self.optimizers.values():
+                o.zero_grad()
+            loss.backward()
+            for o in self.optimizers.values():
+                o.step()
+        return predictions
 
-        # Organize inputs for network (see contents of xs in batchify method)
-        inputs = [xs[0], xs[1], None, xs[2], xs[3], None]
-        inputs = [Variable(x, volatile=True) for x in inputs]
-        output_embeddings, _ = self.model(*inputs)
-
-        scores = self.score(cands, output_embeddings)
-        return self.ranked_predictions(cands, scores)
-
-    def score(self, cands, output_embeddings, answer_embeddings=None):
+    def score(self, cands, output_embeddings):
         last_cand = None
         max_len = max([len(c) for c in cands])
-        scores = Variable(torch.Tensor(len(cands), max_len).fill_(-float('inf')))
-        if self.opt['cuda']:
-            scores = scores.cuda(async=True)
+        scores = Variable(output_embeddings.data.new(len(cands), max_len))
         for i, cand_list in enumerate(cands):
             if last_cand != cand_list:
                 candidate_lengths, candidate_indices = to_tensors(cand_list, self.dict)
                 candidate_lengths, candidate_indices = Variable(candidate_lengths), Variable(candidate_indices)
                 candidate_embeddings = self.model.answer_embedder(candidate_lengths, candidate_indices)
                 if self.opt['cuda']:
-                    candidate_embeddings = candidate_embeddings.cuda(async=True)
+                    candidate_embeddings = candidate_embeddings.cuda()
                 last_cand = cand_list
-            scores[i, :len(cand_list)] = self.model.score.one_to_many(output_embeddings[i].unsqueeze(0), candidate_embeddings)
+            scores[i, :len(cand_list)] = self.model.score.one_to_many(output_embeddings[i].unsqueeze(0), candidate_embeddings).squeeze()
         return scores
 
     def ranked_predictions(self, cands, scores):
+        # return [' '] * len(self.answers)
         _, inds = scores.data.sort(descending=True, dim=1)
         return [[cands[i][j] for j in r if j < len(cands[i])]
                     for i, r in enumerate(inds)]
 
-    def parse(self, text):
+    def decode(self, output_embeddings, ys=None):
+        batchsize = output_embeddings.size(0)
+        hn = output_embeddings.unsqueeze(0).expand(self.opt['rnn_layers'], batchsize, output_embeddings.size(1))
+        x = self.model.answer_embedder(Variable(torch.LongTensor([1])), Variable(self.START_TENSOR))
+        xes = x.unsqueeze(1).expand(x.size(0), batchsize, x.size(1))
+
+        loss = 0
+        output_lines = [[] for _ in range(batchsize)]
+        done = [False for _ in range(batchsize)]
+        total_done = 0
+        idx = 0
+        while(total_done < batchsize) and idx < self.longest_label:
+            # keep producing tokens until we hit END or max length for each ex
+            if self.opt['cuda']:
+                xes = xes.cuda()
+                hn = hn.contiguous()
+            preds, scores = self.decoder(xes, hn)
+            if ys is not None:
+                y = Variable(ys[0][:, idx])
+                temp_y = y.cuda() if self.opt['cuda'] else y
+                loss += self.loss_fn(scores, temp_y)
+            else:
+                y = preds
+            # use the true token as the next input for better training
+            xes = self.model.answer_embedder(Variable(torch.LongTensor(preds.numel()).fill_(1)), y).unsqueeze(0)
+
+            for b in range(batchsize):
+                if not done[b]:
+                    token = self.dict.vec2txt(preds.data[b])
+                    if token == self.END:
+                        done[b] = True
+                        total_done += 1
+                    else:
+                        output_lines[b].append(token)
+            idx += 1
+        return output_lines, loss
+
+    def generated_predictions(self, output_lines):
+        return [[' '.join(c for c in o if c != self.END
+                        and c != self.dict.null_token)] for o in output_lines]
+
+    def parse(self, memory):
         """Returns:
             query = tensor (vector) of token indices for query
             query_length = length of query
             memory = tensor (matrix) where each row contains token indices for a memory
             memory_lengths = tensor (vector) with lengths of each memory
         """
-        sp = text.split('\n')
-        query_sentence = sp[-1]
-        query = self.dict.txt2vec(query_sentence)
+        query = memory.pop()
         query = torch.LongTensor(query)
         query_length = torch.LongTensor([len(query)])
 
-        sp = sp[:-1]
-        sentences = []
-        for s in sp:
-            sentences.extend(s.split('\t'))
-        if len(sentences) == 0:
-            sentences.append(self.dict.null_token)
+        if len(memory) == 0:
+            memory.append([self.NULL_IDX])
 
-        num_mems = min(self.mem_size, len(sentences))
-        memory_sentences = sentences[-num_mems:]
-        memory = [self.dict.txt2vec(s) for s in memory_sentences]
         memory = [torch.LongTensor(m) for m in memory]
         memory_lengths = torch.LongTensor([len(m) for m in memory])
         memory = torch.cat(memory)
-
         return (query, memory, query_length, memory_lengths)
 
     def batchify(self, obs):
@@ -192,8 +293,10 @@ class MemnnAgent(Agent):
             cands = list of candidates for each example in batch
             valid_inds = list of indices for examples with valid observations
         """
-        exs = [ex for ex in obs if 'text' in ex]
-        valid_inds = [i for i, ex in enumerate(obs) if 'text' in ex]
+        exs = [ex for ex in obs if 'text' in ex and len(ex['text']) > 0]
+        valid_inds = [i for i, ex in enumerate(obs) if 'text' in ex and len(ex['text']) > 0]
+        if not exs:
+            return [None] * 4
 
         parsed = [self.parse(ex['text']) for ex in exs]
         queries = torch.cat([x[0] for x in parsed])
@@ -211,7 +314,10 @@ class MemnnAgent(Agent):
             parsed = [self.dict.txt2vec(l) for l in self.labels]
             parsed = [torch.LongTensor(p) for p in parsed]
             label_lengths = torch.LongTensor([len(p) for p in parsed]).unsqueeze(1)
-            labels = torch.cat(parsed)
+            self.longest_label = max(self.longest_label, label_lengths.max())
+            padded = [torch.cat((p, torch.LongTensor(self.longest_label - len(p))
+                        .fill_(self.END_TENSOR[0]))) for p in parsed]
+            labels = torch.stack(padded)
             ys = [labels, label_lengths]
 
         cands = [ex['label_candidates'] for ex in exs if 'label_candidates' in ex]
@@ -223,7 +329,6 @@ class MemnnAgent(Agent):
             self.last_cands = cands
             self.last_cands_list = [list(c) for c in cands]
         cands = self.last_cands_list
-
         return xs, ys, cands, valid_inds
 
     def batch_act(self, observations):
@@ -232,14 +337,11 @@ class MemnnAgent(Agent):
 
         xs, ys, cands, valid_inds = self.batchify(observations)
 
-        if len(xs[1]) == 0:
+        if xs is None or len(xs[1]) == 0:
             return batch_reply
 
         # Either train or predict
-        if ys is not None:
-            predictions = self.update(xs, ys, cands)
-        else:
-            predictions = self.predict(xs, cands)
+        predictions = self.predict(xs, cands, ys)
 
         for i in range(len(valid_inds)):
             self.answers[valid_inds[i]] = predictions[i][0]
@@ -254,16 +356,24 @@ class MemnnAgent(Agent):
         path = self.opt.get('model_file', None) if path is None else path
 
         if path:
-            model_state = self.model.state_dict()
-            optim_state = self.optimizer.state_dict()
+            checkpoint = {}
+            checkpoint['memnn'] = self.model.state_dict()
+            checkpoint['memnn_optim'] = self.optimizers['memnn'].state_dict()
+            if self.decoder is not None:
+                checkpoint['decoder'] = self.decoder.state_dict()
+                checkpoint['decoder_optim'] = self.optimizers['decoder'].state_dict()
+                checkpoint['longest_label'] = self.longest_label
             with open(path, 'wb') as write:
-                torch.save((model_state, optim_state), write)
+                torch.save(checkpoint, write)
 
     def load(self, path):
-        with open(path, 'rb') as read:
-            (model, optim) = torch.load(read)
-        self.model.load_state_dict(model)
-        self.optimizer.load_state_dict(optim)
+        checkpoint = torch.load(path, map_location=lambda cpu, _: cpu)
+        self.model.load_state_dict(checkpoint['memnn'])
+        self.optimizers['memnn'].load_state_dict(checkpoint['memnn_optim'])
+        if self.decoder is not None:
+            self.decoder.load_state_dict(checkpoint['decoder'])
+            self.optimizers['decoder'].load_state_dict(checkpoint['decoder_optim'])
+            self.longest_label = checkpoint['longest_label']
 
 
 def to_tensors(sentences, dictionary):

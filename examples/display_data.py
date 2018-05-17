@@ -17,26 +17,38 @@ from parlai.core.worlds import create_task
 
 import random
 
-def main():
-    random.seed(42)
-
-    # Get command line arguments
-    parser = ParlaiParser()
-    parser.add_argument('-n', '--num-examples', default=10)
-    opt = parser.parse_args()
-
+def display_data(opt):
     # create repeat label agent and assign it to the specified task
     agent = RepeatLabelAgent(opt)
     world = create_task(opt, agent)
 
     # Show some example dialogs.
-    with world:
-        for k in range(int(opt['num_examples'])):
-            world.parley()
-            print(world.display() + '\n~~')
-            if world.epoch_done():
-                print('EPOCH DONE')
-                break
+    for _ in range(opt['num_examples']):
+        world.parley()
+        print(world.display() + '\n~~')
+        if world.epoch_done():
+            print('EPOCH DONE')
+            break
+
+    try:
+        # print dataset size if available
+        print('[ loaded {} episodes with a total of {} examples ]'.format(
+            world.num_episodes(), world.num_examples()
+        ))
+    except:
+        pass
+
+
+def main():
+    random.seed(42)
+
+    # Get command line arguments
+    parser = ParlaiParser()
+    parser.add_argument('-n', '--num-examples', default=10, type=int)
+    parser.set_defaults(datatype='train:stream')
+    opt = parser.parse_args()
+
+    display_data(opt)
 
 if __name__ == '__main__':
     main()

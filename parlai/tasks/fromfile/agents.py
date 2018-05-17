@@ -7,10 +7,9 @@
 # This task simply loads the specified file: useful for quick tests without
 # setting up a new task.
 
-from parlai.core.fbdialog_teacher import FbDialogTeacher
+from parlai.core.teachers import FbDialogTeacher
 
 import copy
-import os
 
 class DefaultTeacher(FbDialogTeacher):
     """This task simply loads the specified file: useful for quick tests without
@@ -20,7 +19,7 @@ class DefaultTeacher(FbDialogTeacher):
     @staticmethod
     def add_cmdline_args(argparser):
         agent = argparser.add_argument_group('FromFile Task Arguments')
-        agent.add_argument('--fromfile_datapath', type=str,
+        agent.add_argument('--fromfile-datapath', type=str,
                            help="Data file in FbDialogFormat")
 
     def __init__(self, opt, shared=None):

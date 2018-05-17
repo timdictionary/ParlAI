@@ -15,7 +15,7 @@
     the ``Teacher`` class.
 
     ``MultiTaskTeacher(Teacher)``
-    creates a set of teachers based on a "task string" passed to the ``Teacher``,
+    creates a set of teachers based on a task string passed to the ``Teacher``,
     creating multiple teachers within it and alternating between them.
 
 All agents are initialized with the following parameters:
@@ -37,11 +37,12 @@ This module also provides a utility method:
 
 """
 
-from .metrics import Metrics
+from .metrics import Metrics, aggregate_metrics
 import copy
 import importlib
+import pickle
 import random
-
+import os
 
 class Agent(object):
     """Base class for all other agents."""
@@ -73,15 +74,19 @@ class Agent(object):
     def getID(self):
         return self.id
 
+    def epoch_done(self):
+        return False
+
     def reset(self):
         self.observation = None
 
     def reset_metrics(self):
         pass
 
-    def save(self):
+    def save(self, path=None):
         """If applicable, save any parameters needed to recreate this agent from
-        loaded parameters."""
+        loaded parameters.
+        """
         pass
 
     def share(self):
@@ -104,7 +109,7 @@ class Teacher(Agent):
 
     def __init__(self, opt, shared=None):
         if not hasattr(self, 'opt'):
-             self.opt = copy.deepcopy(opt)
+            self.opt = copy.deepcopy(opt)
         if not hasattr(self, 'id'):
             self.id = opt.get('task', 'teacher')
         if not hasattr(self, 'metrics'):
@@ -114,31 +119,25 @@ class Teacher(Agent):
                 self.metrics = Metrics(opt)
         self.epochDone = False
 
-    def __iter__(self):
-        """Teacher can be iterated over. Subclasses can specify a certain length
-        of iteration, such as e.g. one epoch.
-        """
-        self.epochDone = False
-        return self
-
-    def __next__(self):
-        """Raise ``StopIteration`` if epoch is done (never for default teacher)."""
-        if self.epochDone:
-            raise StopIteration()
-
     # return state/action dict based upon passed state
     def act(self):
         if self.observation is not None and 'text' in self.observation:
-            t = { 'text': 'Hello agent!' }
+            t = {'text': 'Hello agent!'}
         return t
 
     def epoch_done(self):
         return self.epochDone
 
+    # Default unknown length
+    def num_examples(self):
+        return None
+
+    def num_episodes(self):
+        return None
+
     # Return transformed metrics showing total examples and accuracy if avail.
     def report(self):
-        report = self.metrics.report()
-        return report
+        return self.metrics.report()
 
     def reset(self):
         super().reset()
@@ -168,6 +167,10 @@ class MultiTaskTeacher(Teacher):
     def __init__(self, opt, shared=None):
         self.tasks = []
         self.opt = opt
+
+        opt['batch_sort'] = False
+        print('WARNING: batch_sort disabled for multitasking')
+
         self.id = opt['task']
         if shared and 'tasks' in shared:
             self.tasks = [create_agent_from_shared(t) for t in shared['tasks']]
@@ -184,20 +187,25 @@ class MultiTaskTeacher(Teacher):
         self.new_task = True
         self.random = opt.get('datatype') == 'train'
 
-    def __len__(self):
-        if not hasattr(self, 'len'):
-            self.len = 0
-            # length is sum of all task lengths
-            for _ind, t in enumerate(self.tasks):
-                self.len += len(t)
-        return self.len
+    def num_examples(self):
+        if not hasattr(self, 'num_exs'):
+            # num_examples is sum of all examples in all tasks
+            tasks_num_exs = [t.num_examples() for t in self.tasks]
+            if any(num is None for num in tasks_num_exs):
+                self.num_exs = None
+            else:
+                self.num_exs = sum(tasks_num_exs)
+        return self.num_exs
 
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        if self.epoch_done():
-            raise StopIteration()
+    def num_episodes(self):
+        if not hasattr(self, 'num_eps'):
+            # num_episodes is sum of all num_episodes in all tasks
+            tasks_num_eps = [t.num_episodes() for t in self.tasks]
+            if any(num is None for num in tasks_num_eps):
+                self.num_eps = None
+            else:
+                self.num_eps = sum(tasks_num_eps)
+        return self.num_eps
 
     def observe(self, observation):
         return self.tasks[self.task_idx].observe(observation)
@@ -231,23 +239,7 @@ class MultiTaskTeacher(Teacher):
 
     # return transformed metrics showing total examples and accuracy if avail.
     def report(self):
-        m = {}
-        m['tasks'] = {}
-        sum_accuracy = 0
-        num_tasks = 0
-        total = 0
-        for i in range(len(self.tasks)):
-            mt = self.tasks[i].report()
-            m['tasks'][self.tasks[i].getID()] = mt
-            total += mt['total']
-            if 'accuracy' in mt:
-                sum_accuracy += mt['accuracy']
-                num_tasks += 1
-        m['total'] = total
-        m['accuracy'] = 0
-        if num_tasks > 0:
-            m['accuracy'] = sum_accuracy / num_tasks
-        return m
+        return aggregate_metrics(self.tasks)
 
     def reset(self):
         for t in self.tasks:
@@ -282,6 +274,25 @@ def name_to_agent_class(name):
     class_name += 'Agent'
     return class_name
 
+def load_agent_module(opt):
+    model_file = opt['model_file']
+    optfile =  model_file + '.opt'
+    if os.path.isfile(optfile):
+        with open(optfile, 'rb') as handle:
+           new_opt = pickle.load(handle)
+        # only override opts specified in 'override' dict
+        if opt.get('override'):
+            for k in opt['override']:
+                v = opt[k]
+                print("[ warning: overriding opt['" + str(k) + "'] to " + str(v) +
+                      " (previously:" + str(str(new_opt.get(k, None))) + ") ]")
+                new_opt[k] = v
+        new_opt['model_file'] = model_file
+        model_class = get_agent_module(new_opt['model'])
+        return model_class(new_opt)
+    else:
+        return None
+
 def get_agent_module(dir_name):
     if ':' in dir_name:
         s = dir_name.split(':')
@@ -298,22 +309,46 @@ def get_agent_module(dir_name):
     model_class = getattr(my_module, class_name)
     return model_class
 
-def create_agent(opt):
+
+def create_agent(opt, requireModelExists=False):
     """Create an agent from the options ``model``, ``model_params`` and ``model_file``.
     The input is either of the form ``parlai.agents.ir_baseline.agents:IrBaselineAgent``
     (i.e. the path followed by the class name) or else just ``ir_baseline`` which
     assumes the path above, and a class name suffixed with 'Agent'.
+
+    If ``model-file`` is available in the options this function can also attempt to load
+    the model from that location instead. This avoids having to specify all the other
+    options necessary to set up the model including its name as they are all loaded from
+    the options file if it exists (the file opt['model_file'] + '.opt' must exist and
+    contain a pickled dict containing the model's options).
     """
+    if opt.get('model_file'):
+        if requireModelExists and not os.path.isfile(opt['model_file']):
+            raise RuntimeError('WARNING: Model file does not exist, check to make '
+                               'sure it is correct: {}'.format(opt['model_file']))
+        # Attempt to load the model from the model file first (this way we do not even
+        # have to specify the model name as a parameter.
+        model = load_agent_module(opt)
+        if model is not None:
+            return model
+        else:
+            print("[ no model with opt yet at: " + opt.get('model_file') + "(.opt) ]")
+
     if opt.get('model'):
         model_class = get_agent_module(opt['model'])
-        return model_class(opt)
+        model = model_class(opt)
+        if requireModelExists and hasattr(model, 'load') and not opt.get('model_file'):
+            # double check that we didn't forget to set model_file on loadable model
+            print('WARNING: model_file unset but model has a `load` function.')
+        return model
     else:
         raise RuntimeError('Need to set `model` argument to use create_agent.')
 
 # Helper functions to create agent/agents given shared parameters
 # returned from agent.share(). Useful for parallelism, sharing params, etc.
 def create_agent_from_shared(shared_agent):
-    a = shared_agent['class'](shared_agent['opt'], shared_agent)
+    opt = copy.deepcopy(shared_agent['opt'])
+    a = shared_agent['class'](opt, shared_agent)
     return a
 
 def create_agents_from_shared(shared):
@@ -329,6 +364,8 @@ def get_task_module(taskname):
     sp = taskname.strip().split(':')
     if '.' in sp[0]:
         module_name = sp[0]
+    elif sp[0] == 'pytorch_teacher':
+        module_name = 'parlai.core.pytorch_data_teacher'
     else:
         task = sp[0].lower()
         module_name = "parlai.tasks.%s.agents" % (task)
@@ -336,9 +373,13 @@ def get_task_module(taskname):
         sp[1] = sp[1][0].upper() + sp[1][1:]
         teacher = sp[1]
         if '.' not in sp[0] and 'Teacher' not in teacher:
-            # Append "Teacher" to class name by default if
-            # a complete path is not given.
-            teacher += "Teacher"
+            # Reformat from underscore to CamelCase and append "Teacher" to
+            # class name by default if a complete path is not given.
+            words = teacher.split('_')
+            teacher_name = ''
+            for w in words:
+                teacher_name += ( w[0].upper() + w[1:])
+            teacher = teacher_name + "Teacher"
     else:
         teacher = "DefaultTeacher"
     my_module = importlib.import_module(module_name)
@@ -385,6 +426,8 @@ def _create_task_agents(opt):
         # The case of opt['task'] = 'parlai.tasks.squad.agents:DefaultTeacher'
         # (i.e. specifying your own path directly)
         module_name = sp[0]
+    elif sp[0] == 'pytorch_teacher':
+        module_name = 'parlai.core.pytorch_data_teacher'
     else:
         task = sp[0].lower()
         module_name = "parlai.tasks.%s.agents" % (task)

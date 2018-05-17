@@ -30,7 +30,7 @@ python display_data.py -t babi:task1k:1,squad -n 100
 
 Evaluate on the bAbI test set with a human agent (using the local keyboard as input):
 ```bash
-python examples/eval_model.py -m local_human -t babi:Task1k:1 -dt valid
+python eval_model.py -m local_human -t babi:Task1k:1 -dt valid
 ```
 
 Evaluate an IR baseline model on the validation set of the Movies Subreddit dataset:
@@ -50,7 +50,7 @@ python build_dict.py -t babi:task1k:1 --dict-file /tmp/dict.tsv
 
 Train a simple sequence to sequence model on the "1k training examples" bAbI task 1 with batch size of 8 examples for one epoch (requires pytorch):
 ```bash
-python train_model.py -m seq2seq -t babi:task1k:1 -bs 8 -e 1 -mf /tmp/model_s2s
+python train_model.py -m seq2seq -t babi:task1k:1 -bs 8 -eps 1 -mf /tmp/model_s2s
 ```
 
 Trains an attentive LSTM model of [Chen et al.](https://arxiv.org/abs/1704.00051) on the SQuAD dataset with a batch size of 32 examples (requires pytorch):
@@ -68,9 +68,4 @@ Interactive session on an already trained SQuAD model:
 ```bash
 wget https://s3.amazonaws.com/fair-data/parlai/_models/drqa/squad.mdl
 python interactive.py -m drqa -mf squad.mdl
-```
-
-Train a simple cpu-based memory network on the "10k training examples" bAbI task 1 with 8 threads (python processes) using Hogwild (requires zmq and Lua Torch):
-```bash
-python memnn_luatorch_cpu/full_task_train.py -t babi:task10k:1 -nt 8
 ```
